@@ -35,15 +35,17 @@ class Parser:
         factor: int = 1,
         normalize: bool = False,
         test_every: int = 8,
+        colmap_dir: str = "sparse/0/",
     ):
         self.data_dir = data_dir
         self.factor = factor
         self.normalize = normalize
         self.test_every = test_every
 
-        colmap_dir = os.path.join(data_dir, "sparse/0/")
-        if not os.path.exists(colmap_dir):
-            colmap_dir = os.path.join(data_dir, "sparse")
+        # colmap_dir = os.path.join(data_dir, "sparse/0/")
+        # if not os.path.exists(colmap_dir):
+        #     colmap_dir = os.path.join(data_dir, "sparse")
+        colmap_dir = os.path.join(data_dir, colmap_dir)
         assert os.path.exists(
             colmap_dir
         ), f"COLMAP directory {colmap_dir} does not exist."
@@ -297,6 +299,7 @@ class Parser:
         scene_center = np.mean(camera_locations, axis=0)
         dists = np.linalg.norm(camera_locations - scene_center, axis=1)
         self.scene_scale = np.max(dists)
+        print(f"[Parser] Scene scale: {self.scene_scale:.2f}")
 
 
 class Dataset:
