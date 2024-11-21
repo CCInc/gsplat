@@ -170,20 +170,10 @@ class DefaultStrategy(Strategy):
             and step % self.reset_every >= self.pause_refine_after_reset
         ):
             # grow GSs
-            n_dupli, n_split = self._grow_gs(params, optimizers, state, step)
-            if self.verbose:
-                print(
-                    f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split. "
-                    f"Now having {len(params['means'])} GSs."
-                )
+            self._grow_gs(params, optimizers, state, step)
 
             # prune GSs
-            n_prune = self._prune_gs(params, optimizers, state, step)
-            if self.verbose:
-                print(
-                    f"Step {step}: {n_prune} GSs pruned. "
-                    f"Now having {len(params['means'])} GSs."
-                )
+            self._prune_gs(params, optimizers, state, step)
 
             # reset running stats
             state["grad2d"].zero_()
@@ -282,8 +272,12 @@ class DefaultStrategy(Strategy):
 
         is_large = ~is_small
         is_split = is_grad_high & is_large
+        n_split_3d = is_split.sum().item()
+        n_split_2d = 0
         if step < self.refine_scale2d_stop_iter:
-            is_split |= state["radii"] > self.grow_scale2d
+            split_2d = state["radii"] > self.grow_scale2d
+            n_split_2d = split_2d.sum().item()
+            is_split |= split_2d
         n_split = is_split.sum().item()
 
         # first duplicate
@@ -307,6 +301,14 @@ class DefaultStrategy(Strategy):
                 mask=is_split,
                 revised_opacity=self.revised_opacity,
             )
+
+        if self.verbose:
+            print(
+                f"Step {step}: {n_dupli} 3D GSs duplicated (grad > grow_grad2d & scale <= grow_scale3d), "
+                f"{n_split} GSs split ({n_split_3d} whose grad > grow_grad2d & scale > grow_scale3d; "
+                f"{n_split_2d} whose radii > grow_scale2d). "
+                f"Now having {len(params['means'])} GSs."
+            )
         return n_dupli, n_split
 
     @torch.no_grad()
@@ -318,23 +320,35 @@ class DefaultStrategy(Strategy):
         step: int,
     ) -> int:
         is_prune = torch.sigmoid(params["opacities"].flatten()) < self.prune_opa
+        n_prune_opa = is_prune.sum().item()
+        n_prune_scale3d, n_prune_scale2d = 0, 0
         if step > self.reset_every:
             is_too_big = (
                 torch.exp(params["scales"]).max(dim=-1).values
                 > self.prune_scale3d * state["scene_scale"]
             )
+            n_prune_scale3d = is_too_big.sum().item()
             # The official code also implements sreen-size pruning but
             # it's actually not being used due to a bug:
             # https://github.com/graphdeco-inria/gaussian-splatting/issues/123
             # We implement it here for completeness but set `refine_scale2d_stop_iter`
             # to 0 by default to disable it.
             if step < self.refine_scale2d_stop_iter:
-                is_too_big |= state["radii"] > self.prune_scale2d
+                prune_2d = state["radii"] > self.prune_scale2d
+                is_too_big |= prune_2d
+                n_prune_scale2d = prune_2d.sum().item()
 
             is_prune = is_prune | is_too_big
 
         n_prune = is_prune.sum().item()
         if n_prune > 0:
             remove(params=params, optimizers=optimizers, state=state, mask=is_prune)
+
+        if self.verbose:
+            print(
+                f"Step {step}: {n_prune} GSs pruned (opa: {n_prune_opa}, "
+                f"scale3d: {n_prune_scale3d}, scale2d: {n_prune_scale2d}). "
+                f"Now having {len(params['means'])} GSs."
+            )
 
         return n_prune
