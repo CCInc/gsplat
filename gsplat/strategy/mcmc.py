@@ -153,8 +153,8 @@ class MCMCStrategy(Strategy):
     ) -> int:
         opacities = torch.sigmoid(params["opacities"].flatten())
         dead_mask = opacities <= self.min_opacity
-        nan_mask = torch.isnan(opacities)
-        dead_mask = dead_mask | nan_mask
+        # nan_mask = torch.isnan(opacities)
+        # dead_mask = dead_mask | nan_mask
         n_gs = dead_mask.sum().item()
         if n_gs > 0:
             relocate(

@@ -36,8 +36,11 @@ class Parser:
         normalize: bool = False,
         test_every: int = 8,
         colmap_dir: str = "sparse/0/",
+        images_dir="images",
+        masks_dir="",
     ):
         self.data_dir = data_dir
+        self.masks_dir=masks_dir
         self.factor = factor
         self.normalize = normalize
         self.test_every = test_every
@@ -50,7 +53,7 @@ class Parser:
             colmap_dir
         ), f"COLMAP directory {colmap_dir} does not exist."
 
-        manager = SceneManager(colmap_dir)
+        manager = SceneManager(colmap_dir, images_dir)
         manager.load_cameras()
         manager.load_images()
         manager.load_points3D()
@@ -155,8 +158,8 @@ class Parser:
             image_dir_suffix = f"_{factor}"
         else:
             image_dir_suffix = ""
-        colmap_image_dir = os.path.join(data_dir, "images")
-        image_dir = os.path.join(data_dir, "images" + image_dir_suffix)
+        colmap_image_dir = os.path.join(data_dir, images_dir)
+        image_dir = os.path.join(data_dir, images_dir + image_dir_suffix)
         for d in [image_dir, colmap_image_dir]:
             if not os.path.exists(d):
                 raise ValueError(f"Image folder {d} does not exist.")
@@ -167,6 +170,9 @@ class Parser:
         image_files = sorted(_get_rel_paths(image_dir))
         colmap_to_image = dict(zip(colmap_files, image_files))
         image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
+        masks_paths = None
+        if masks_dir:
+            masks_paths = [os.path.join(data_dir, masks_dir, colmap_to_image[f]) for f in image_names]
 
         # 3D points and {image_name -> [point_idx]}
         points = manager.points3D.astype(np.float32)
@@ -200,6 +206,7 @@ class Parser:
 
         self.image_names = image_names  # List[str], (num_images,)
         self.image_paths = image_paths  # List[str], (num_images,)
+        self.masks_paths = masks_paths  # List[str], (num_images,)
         self.camtoworlds = camtoworlds  # np.ndarray, (num_images, 4, 4)
         self.camera_ids = camera_ids  # List[int], (num_images,)
         self.Ks_dict = Ks_dict  # Dict of camera_id -> K
@@ -218,6 +225,7 @@ class Parser:
         actual_height, actual_width = actual_image.shape[:2]
         colmap_width, colmap_height = self.imsize_dict[self.camera_ids[0]]
         s_height, s_width = actual_height / colmap_height, actual_width / colmap_width
+        print(f"[Parser] Image size: {actual_width}x{actual_height}, COLMAP size: {colmap_width}x{colmap_height}")
         for camera_id, K in self.Ks_dict.items():
             K[0, :] *= s_width
             K[1, :] *= s_height
@@ -296,10 +304,11 @@ class Parser:
 
         # size of the scene measured by cameras
         camera_locations = camtoworlds[:, :3, 3]
+        print(camera_locations)
         scene_center = np.mean(camera_locations, axis=0)
         dists = np.linalg.norm(camera_locations - scene_center, axis=1)
         self.scene_scale = np.max(dists)
-        print(f"[Parser] Scene scale: {self.scene_scale:.2f}")
+        print(f"[Parser] Scene scale: {self.scene_scale:.2f}, scene center: {scene_center}, mean dist: {np.mean(dists):.2f}")
 
 
 class Dataset:
@@ -333,6 +342,9 @@ class Dataset:
         params = self.parser.params_dict[camera_id]
         camtoworlds = self.parser.camtoworlds[index]
         mask = self.parser.mask_dict[camera_id]
+        if self.parser.masks_paths:
+            mask_path = self.parser.masks_paths[index]
+            mask = imageio.imread(mask_path) > 128
 
         if len(params) > 0:
             # Images are distorted. Undistort them.

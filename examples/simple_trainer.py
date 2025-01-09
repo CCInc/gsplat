@@ -1,10 +1,12 @@
 import json
 import math
 import os
+from pathlib import Path
 import time
 from dataclasses import dataclass, field
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple, Union
+import struct
 
 import imageio
 import nerfview
@@ -56,12 +58,15 @@ class Config:
 
     # Path to the Mip-NeRF 360 dataset
     data_dir: str = "data/360_v2/garden"
+    colmap_dir: str = "sparse/0/"
+    images_dir: str = "images"
+    masks_dir: str = ""
     # Downsample factor for the dataset
     data_factor: int = 4
     # Directory to save results
     result_dir: str = "results/garden"
     # Every N images there is a test image
-    test_every: int = 8
+    test_every: int = 50
     # Random crop size for training  (experimental)
     patch_size: Optional[int] = None
     # A global scaler that applies to the scene size related parameters
@@ -82,9 +87,11 @@ class Config:
     # Number of training steps
     max_steps: int = 30_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: [100, 1000, 3000, 7_000, 30_000])
     # Steps to save the model
     save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    # Steps to save the model as ply
+    ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
 
     # Initialization strategy
     init_type: str = "sfm"
@@ -102,6 +109,7 @@ class Config:
     init_scale: float = 1.0
     # Weight for SSIM loss
     ssim_lambda: float = 0.2
+    init_scale_cm: float = 1.0
 
     # Near plane clipping distance
     near_plane: float = 0.01
@@ -200,6 +208,7 @@ def create_splats_with_optimizers(
     device: str = "cuda",
     world_rank: int = 0,
     world_size: int = 1,
+    init_scale_cm = 1.0,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
     if init_type == "sfm":
         points = torch.from_numpy(parser.points).float()
@@ -214,6 +223,7 @@ def create_splats_with_optimizers(
     dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
     dist_avg = torch.sqrt(dist2_avg)
     scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
+    scales = torch.log(torch.ones_like(dist_avg) * 0.002 * init_scale_cm * scene_scale * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
 
     # Distribute the GSs to different ranks (also works for single rank)
     points = points[world_rank::world_size]
@@ -294,6 +304,8 @@ class Runner:
         os.makedirs(self.stats_dir, exist_ok=True)
         self.render_dir = f"{cfg.result_dir}/renders"
         os.makedirs(self.render_dir, exist_ok=True)
+        self.ply_dir = f"{cfg.result_dir}/ply"
+        os.makedirs(self.ply_dir, exist_ok=True)
 
         # Tensorboard
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
@@ -304,6 +316,9 @@ class Runner:
             factor=cfg.data_factor,
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
+            colmap_dir=cfg.colmap_dir,
+            images_dir=cfg.images_dir,
+            masks_dir=cfg.masks_dir,
         )
         self.trainset = Dataset(
             self.parser,
@@ -333,6 +348,7 @@ class Runner:
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
+            init_scale_cm=cfg.init_scale_cm,
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 
@@ -669,6 +685,7 @@ class Runner:
                     loss
                     + cfg.scale_reg * torch.abs(torch.exp(self.splats["scales"])).mean()
                 )
+                print("Scale loss: ", cfg.scale_reg * torch.abs(torch.exp(self.splats["scales"])).mean())
 
             loss.backward()
 
@@ -735,7 +752,20 @@ class Runner:
                 torch.save(
                     data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 )
+            if step in [i - 1 for i in cfg.ply_steps] or step == max_steps - 1:
+                rgb = None
+                if self.cfg.app_opt:
+                    # eval at origin to bake the appeareance into the colors
+                    rgb = self.app_module(
+                        features=self.splats["features"],
+                        embed_ids=None,
+                        dirs=torch.zeros_like(self.splats["means"][None, :, :]),
+                        sh_degree=sh_degree_to_use,
+                    )
+                    rgb = rgb + self.splats["colors"]
+                    rgb = torch.sigmoid(rgb).squeeze(0)
 
+                save_ply(self.splats, f"{self.ply_dir}/point_cloud_{step}.ply", rgb)
             # Turn Gradients into Sparse Tensor before running optimizer
             if cfg.sparse_grad:
                 assert cfg.packed, "Sparse gradients only work with packed mode."
@@ -805,7 +835,7 @@ class Runner:
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
                 self.eval(step)
-                self.render_traj(step)
+                # self.render_traj(step)
 
             # run compression
             if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
@@ -1013,6 +1043,95 @@ class Runner:
         )  # [1, H, W, 3]
         return render_colors[0].cpu().numpy()
 
+def save_ply(splats: torch.nn.ParameterDict, dir: str, colors: torch.Tensor = None):
+    # Convert all tensors to numpy arrays in one go
+    print(f"Saving ply to {dir}")
+    numpy_data = {k: v.detach().cpu().numpy() for k, v in splats.items()}
+
+    means = numpy_data["means"]
+    scales = numpy_data["scales"]
+    quats = numpy_data["quats"]
+    opacities = numpy_data["opacities"]
+
+    sh0 = numpy_data["sh0"].transpose(0, 2, 1).reshape(means.shape[0], -1)
+    shN = numpy_data["shN"].transpose(0, 2, 1).reshape(means.shape[0], -1)
+
+    # Create a mask to identify rows with NaN or Inf in any of the numpy_data arrays
+    invalid_mask = (
+        np.isnan(means).any(axis=1)
+        | np.isinf(means).any(axis=1)
+        | np.isnan(scales).any(axis=1)
+        | np.isinf(scales).any(axis=1)
+        | np.isnan(quats).any(axis=1)
+        | np.isinf(quats).any(axis=1)
+        | np.isnan(opacities).any(axis=0)
+        | np.isinf(opacities).any(axis=0)
+        | np.isnan(sh0).any(axis=1)
+        | np.isinf(sh0).any(axis=1)
+        | np.isnan(shN).any(axis=1)
+        | np.isinf(shN).any(axis=1)
+    )
+
+    # Filter out rows with NaNs or Infs from all data arrays
+    means = means[~invalid_mask]
+    scales = scales[~invalid_mask]
+    quats = quats[~invalid_mask]
+    opacities = opacities[~invalid_mask]
+    sh0 = sh0[~invalid_mask]
+    shN = shN[~invalid_mask]
+
+    num_points = means.shape[0]
+
+    with open(dir, "wb") as f:
+        # Write PLY header
+        f.write(b"ply\n")
+        f.write(b"format binary_little_endian 1.0\n")
+        f.write(f"element vertex {num_points}\n".encode())
+        f.write(b"property float x\n")
+        f.write(b"property float y\n")
+        f.write(b"property float z\n")
+        f.write(b"property float nx\n")
+        f.write(b"property float ny\n")
+        f.write(b"property float nz\n")
+
+        if colors is not None:
+            for j in range(colors.shape[1]):
+                f.write(f"property float f_dc_{j}\n".encode())
+        else:
+            for i, data in enumerate([sh0, shN]):
+                prefix = "f_dc" if i == 0 else "f_rest"
+                for j in range(data.shape[1]):
+                    f.write(f"property float {prefix}_{j}\n".encode())
+
+        f.write(b"property float opacity\n")
+
+        for i in range(scales.shape[1]):
+            f.write(f"property float scale_{i}\n".encode())
+        for i in range(quats.shape[1]):
+            f.write(f"property float rot_{i}\n".encode())
+
+        f.write(b"end_header\n")
+
+        # Write vertex data
+        for i in range(num_points):
+            f.write(struct.pack("<fff", *means[i]))  # x, y, z
+            f.write(struct.pack("<fff", 0, 0, 0))  # nx, ny, nz (zeros)
+
+            if colors is not None:
+                color = colors.detach().cpu().numpy()
+                for j in range(color.shape[1]):
+                    f_dc = (color[i, j] - 0.5) / 0.2820947917738781
+                    f.write(struct.pack("<f", f_dc))
+            else:
+                for data in [sh0, shN]:
+                    for j in range(data.shape[1]):
+                        f.write(struct.pack("<f", data[i, j]))
+
+            f.write(struct.pack("<f", opacities[i]))  # opacity
+
+            for data in [scales, quats]:
+                for j in range(data.shape[1]):
+                    f.write(struct.pack("<f", data[i, j]))
 
 def main(local_rank: int, world_rank, world_size: int, cfg: Config):
     if world_size > 1 and not cfg.disable_viewer:
@@ -1041,6 +1160,9 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
     if not cfg.disable_viewer:
         print("Viewer running... Ctrl+C to exit.")
         time.sleep(1000000)
+
+    # from save_ply import save_ply
+    # save_ply(runner, Path(cfg.result_dir) / ((Path(cfg.result_dir).stem + ".ply")))
 
 
 if __name__ == "__main__":
